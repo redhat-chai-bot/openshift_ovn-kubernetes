@@ -21,7 +21,7 @@ RUN cd openshift; CGO_ENABLED=0 ./hack/build-tests-ext.sh && \
 # - creating directories required by ovn-kubernetes
 # - git commit number
 # - ovnkube.sh script
-FROM registry.ci.openshift.org/ocp/5.0:ovn-kubernetes-base
+FROM quay-proxy.ci.openshift.org/openshift/ci:ocp_5.0_ovn-kubernetes-base
 
 USER root
 
