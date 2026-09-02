@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 
 	"github.com/urfave/cli/v2"
 
@@ -38,6 +39,19 @@ add map inet ovn-kubernetes egress-service-snat-v4 { type ipv4_addr : ipv4_addr 
 add rule inet ovn-kubernetes egress-services mark == 0x3f0 return comment "DoNotSNAT"
 add rule inet ovn-kubernetes egress-services snat to ip saddr map @egress-service-snat-v4
 `
+
+// failingNFT wraps a knftables.Interface and fails the first N Run() calls.
+type failingNFT struct {
+	knftables.Interface
+	remaining atomic.Int32
+}
+
+func (f *failingNFT) Run(ctx context.Context, tx *knftables.Transaction) error {
+	if f.remaining.Add(-1) >= 0 {
+		return fmt.Errorf("simulated nftables failure")
+	}
+	return f.Interface.Run(ctx, tx)
+}
 
 var _ = Describe("Egress Service Operations", func() {
 	var (
@@ -643,6 +657,300 @@ add element inet ovn-kubernetes egress-service-snat-v4 { 10.128.0.11 comment "na
 				}).ShouldNot(HaveOccurred())
 
 				Expect(fExec.CalledMatchesExpected()).To(BeTrue(), fExec.ErrorDesc)
+				return nil
+			}
+			err := app.Run([]string{app.Name})
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("creates nftables SNAT and ip rules for endpoints on remote nodes with Network and ETP=Cluster", func() {
+			app.Action = func(*cli.Context) error {
+				fExec.AddFakeCmd(&ovntest.ExpectedCmd{
+					Cmd:    "ip -4 --json rule show",
+					Output: "[]",
+					Err:    nil,
+				})
+				// ip rules for the ClusterIP
+				fExec.AddFakeCmd(&ovntest.ExpectedCmd{
+					Cmd: "ip -4 rule add prio 5000 from 10.129.0.2 table mynetwork",
+					Err: nil,
+				})
+				// ip rule for the local endpoint
+				fExec.AddFakeCmd(&ovntest.ExpectedCmd{
+					Cmd: "ip -4 rule add prio 5000 from 10.128.0.3 table mynetwork",
+					Err: nil,
+				})
+				// ip rule for the remote endpoint (on a node without VRF)
+				fExec.AddFakeCmd(&ovntest.ExpectedCmd{
+					Cmd: "ip -4 rule add prio 5000 from 10.128.1.5 table mynetwork",
+					Err: nil,
+				})
+				// cleanup ip rules
+				fExec.AddFakeCmd(&ovntest.ExpectedCmd{
+					Cmd: "ip -4 rule del prio 5000 from 10.129.0.2 table mynetwork",
+					Err: nil,
+				})
+				fExec.AddFakeCmd(&ovntest.ExpectedCmd{
+					Cmd: "ip -4 rule del prio 5000 from 10.128.0.3 table mynetwork",
+					Err: nil,
+				})
+				fExec.AddFakeCmd(&ovntest.ExpectedCmd{
+					Cmd: "ip -4 rule del prio 5000 from 10.128.1.5 table mynetwork",
+					Err: nil,
+				})
+				epPortName := "https"
+				epPortValue := int32(443)
+
+				egressService := egressserviceapi.EgressService{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "service1",
+						Namespace: "namespace1",
+					},
+					Spec: egressserviceapi.EgressServiceSpec{
+						SourceIPBy: egressserviceapi.SourceIPLoadBalancer,
+						Network:    "mynetwork",
+					},
+					Status: egressserviceapi.EgressServiceStatus{
+						Host: fakeNodeName,
+					},
+				}
+
+				// ETP=Cluster (isETPLocal=false)
+				service := *newService("service1", "namespace1", "10.129.0.2",
+					[]corev1.ServicePort{
+						{
+							NodePort: int32(31111),
+							Protocol: corev1.ProtocolTCP,
+							Port:     int32(8080),
+						},
+					},
+					corev1.ServiceTypeLoadBalancer,
+					[]string{},
+					corev1.ServiceStatus{
+						LoadBalancer: corev1.LoadBalancerStatus{
+							Ingress: []corev1.LoadBalancerIngress{{
+								IP: "5.5.5.5",
+							}},
+						},
+					},
+					false, false,
+				)
+
+				// endpoint on the host node (has VRF)
+				ep1 := discovery.Endpoint{
+					Addresses: []string{"10.128.0.3"},
+					NodeName:  &fakeNodeName,
+				}
+				epPort := discovery.EndpointPort{
+					Name: &epPortName,
+					Port: &epPortValue,
+				}
+
+				// endpoint on a remote node (without VRF) - the OCPBUGS-92020 scenario
+				someOtherNode := "someOtherNode"
+				ep2 := discovery.Endpoint{
+					Addresses: []string{"10.128.1.5"},
+					NodeName:  &someOtherNode,
+				}
+
+				endpointSlice := *newEndpointSlice(
+					"service1",
+					"namespace1",
+					[]discovery.Endpoint{ep1, ep2},
+					[]discovery.EndpointPort{epPort})
+
+				objects := []runtime.Object{
+					&service,
+					&endpointSlice,
+					&egressService,
+				}
+				stopChan := make(chan struct{})
+				wg := &sync.WaitGroup{}
+				fakeClient := util.GetOVNClientset(objects...).GetNodeClientset()
+				wf, err := factory.NewNodeWatchFactory(fakeClient, "node")
+				Expect(err).ToNot(HaveOccurred())
+				Expect(wf.Start()).To(Succeed())
+				defer func() {
+					close(stopChan)
+					wg.Wait()
+					wf.Shutdown()
+				}()
+
+				c, err := egressservice.NewController(
+					stopChan,
+					nodetypes.OvnKubeNodeSNATMark,
+					"node",
+					wf.EgressServiceInformer(),
+					wf.ServiceInformer(),
+					wf.EndpointSliceInformer(),
+				)
+				Expect(err).ToNot(HaveOccurred())
+				err = c.Run(wg, 1)
+				Expect(err).ToNot(HaveOccurred())
+
+				By("verifying SNAT entries exist for both local and remote endpoints")
+				expectedNFT := nftablesRulesEgressServicesBase + `
+add element inet ovn-kubernetes egress-service-snat-v4 { 10.128.0.3 comment "namespace1/service1" : 5.5.5.5 }
+add element inet ovn-kubernetes egress-service-snat-v4 { 10.128.1.5 comment "namespace1/service1" : 5.5.5.5 }
+`
+				Eventually(func() error {
+					return nodenft.MatchNFTRules(expectedNFT, nft.Dump())
+				}).ShouldNot(HaveOccurred())
+
+				By("deleting the egress service removes all entries")
+				err = fakeClient.EgressServiceClient.K8sV1().EgressServices("namespace1").Delete(context.TODO(), "service1", metav1.DeleteOptions{})
+				Expect(err).ToNot(HaveOccurred())
+
+				expectedNFT = nftablesRulesEgressServicesBase
+				Eventually(func() error {
+					return nodenft.MatchNFTRules(expectedNFT, nft.Dump())
+				}).ShouldNot(HaveOccurred())
+
+				Expect(fExec.CalledMatchesExpected()).To(BeTrue(), fExec.ErrorDesc)
+				return nil
+			}
+			err := app.Run([]string{app.Name})
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("retries nftables SNAT programming after a transient failure for remote endpoints", func() {
+			app.Action = func(*cli.Context) error {
+				fExec.AddFakeCmd(&ovntest.ExpectedCmd{
+					Cmd:    "ip -4 --json rule show",
+					Output: "[]",
+					Err:    nil,
+				})
+				// ip rules for initial endpoint
+				fExec.AddFakeCmd(&ovntest.ExpectedCmd{
+					Cmd: "ip -4 rule add prio 5000 from 10.129.0.2 table mynetwork",
+					Err: nil,
+				})
+				fExec.AddFakeCmd(&ovntest.ExpectedCmd{
+					Cmd: "ip -4 rule add prio 5000 from 10.128.0.3 table mynetwork",
+					Err: nil,
+				})
+				// ip rule for the remote endpoint added later
+				fExec.AddFakeCmd(&ovntest.ExpectedCmd{
+					Cmd: "ip -4 rule add prio 5000 from 10.128.1.5 table mynetwork",
+					Err: nil,
+				})
+				epPortName := "https"
+				epPortValue := int32(443)
+
+				egressService := egressserviceapi.EgressService{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "service1",
+						Namespace: "namespace1",
+					},
+					Spec: egressserviceapi.EgressServiceSpec{
+						SourceIPBy: egressserviceapi.SourceIPLoadBalancer,
+						Network:    "mynetwork",
+					},
+					Status: egressserviceapi.EgressServiceStatus{
+						Host: fakeNodeName,
+					},
+				}
+
+				service := *newService("service1", "namespace1", "10.129.0.2",
+					[]corev1.ServicePort{
+						{
+							NodePort: int32(31111),
+							Protocol: corev1.ProtocolTCP,
+							Port:     int32(8080),
+						},
+					},
+					corev1.ServiceTypeLoadBalancer,
+					[]string{},
+					corev1.ServiceStatus{
+						LoadBalancer: corev1.LoadBalancerStatus{
+							Ingress: []corev1.LoadBalancerIngress{{
+								IP: "5.5.5.5",
+							}},
+						},
+					},
+					false, false,
+				)
+
+				// Start with only a local endpoint.
+				ep1 := discovery.Endpoint{
+					Addresses: []string{"10.128.0.3"},
+					NodeName:  &fakeNodeName,
+				}
+				epPort := discovery.EndpointPort{
+					Name: &epPortName,
+					Port: &epPortValue,
+				}
+				endpointSlice := *newEndpointSlice(
+					"service1",
+					"namespace1",
+					[]discovery.Endpoint{ep1},
+					[]discovery.EndpointPort{epPort})
+
+				objects := []runtime.Object{
+					&service,
+					&endpointSlice,
+					&egressService,
+				}
+				stopChan := make(chan struct{})
+				wg := &sync.WaitGroup{}
+				fakeClient := util.GetOVNClientset(objects...).GetNodeClientset()
+				wf, err := factory.NewNodeWatchFactory(fakeClient, "node")
+				Expect(err).ToNot(HaveOccurred())
+				Expect(wf.Start()).To(Succeed())
+				defer func() {
+					close(stopChan)
+					wg.Wait()
+					wf.Shutdown()
+				}()
+
+				c, err := egressservice.NewController(
+					stopChan,
+					nodetypes.OvnKubeNodeSNATMark,
+					"node",
+					wf.EgressServiceInformer(),
+					wf.ServiceInformer(),
+					wf.EndpointSliceInformer(),
+				)
+				Expect(err).ToNot(HaveOccurred())
+				err = c.Run(wg, 1)
+				Expect(err).ToNot(HaveOccurred())
+
+				By("waiting for the initial local endpoint SNAT entry")
+				initialNFT := nftablesRulesEgressServicesBase + `
+add element inet ovn-kubernetes egress-service-snat-v4 { 10.128.0.3 comment "namespace1/service1" : 5.5.5.5 }
+`
+				Eventually(func() error {
+					return nodenft.MatchNFTRules(initialNFT, nft.Dump())
+				}).ShouldNot(HaveOccurred())
+
+				By("injecting a transient nftables failure, then adding a remote endpoint")
+				failing := &failingNFT{Interface: nft}
+				failing.remaining.Store(1)
+				nodenft.SetNFTablesHelper(failing)
+
+				someOtherNode := "someOtherNode"
+				updatedSlice := newEndpointSlice(
+					"service1",
+					"namespace1",
+					[]discovery.Endpoint{
+						{Addresses: []string{"10.128.0.3"}, NodeName: &fakeNodeName},
+						{Addresses: []string{"10.128.1.5"}, NodeName: &someOtherNode},
+					},
+					[]discovery.EndpointPort{epPort})
+				updatedSlice.ResourceVersion = "100"
+				_, err = fakeClient.KubeClient.DiscoveryV1().EndpointSlices("namespace1").Update(
+					context.TODO(), updatedSlice, metav1.UpdateOptions{})
+				Expect(err).ToNot(HaveOccurred())
+
+				By("verifying the retry programs both SNAT entries after the transient failure")
+				expectedNFT := nftablesRulesEgressServicesBase + `
+add element inet ovn-kubernetes egress-service-snat-v4 { 10.128.0.3 comment "namespace1/service1" : 5.5.5.5 }
+add element inet ovn-kubernetes egress-service-snat-v4 { 10.128.1.5 comment "namespace1/service1" : 5.5.5.5 }
+`
+				Eventually(func() error {
+					return nodenft.MatchNFTRules(expectedNFT, nft.Dump())
+				}).ShouldNot(HaveOccurred())
+
 				return nil
 			}
 			err := app.Run([]string{app.Name})

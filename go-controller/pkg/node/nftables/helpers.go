@@ -16,6 +16,12 @@ const OVNKubernetesNFTablesName = "ovn-kubernetes"
 
 var nftHelper knftables.Interface
 
+// SetNFTablesHelper replaces the nftables helper with the given interface.
+// This is intended for testing scenarios like failure injection.
+func SetNFTablesHelper(iface knftables.Interface) {
+	nftHelper = iface
+}
+
 // SetFakeNFTablesHelper creates a fake knftables.Interface
 func SetFakeNFTablesHelper() *knftables.Fake {
 	fake := knftables.NewFake(knftables.InetFamily, OVNKubernetesNFTablesName)

@@ -764,7 +764,6 @@ func (c *Controller) syncEgressService(key string) error {
 				Value:   []string{cachedState.v4LB},
 				Comment: knftables.PtrTo(key),
 			})
-			cachedState.v4Eps.Insert(ep)
 		}
 
 		for ep := range v4ToDelete {
@@ -772,7 +771,6 @@ func (c *Controller) syncEgressService(key string) error {
 				Map: NFTablesMapV4,
 				Key: []string{ep},
 			})
-			cachedState.v4Eps.Delete(ep)
 		}
 	}
 
@@ -784,7 +782,6 @@ func (c *Controller) syncEgressService(key string) error {
 				Value:   []string{cachedState.v6LB},
 				Comment: knftables.PtrTo(key),
 			})
-			cachedState.v6Eps.Insert(ep)
 		}
 
 		for ep := range v6ToDelete {
@@ -792,13 +789,24 @@ func (c *Controller) syncEgressService(key string) error {
 				Map: NFTablesMapV6,
 				Key: []string{ep},
 			})
-			cachedState.v6Eps.Delete(ep)
 		}
 	}
 
 	err = nft.Run(context.TODO(), tx)
 	if err != nil {
 		return err
+	}
+
+	// Update the cache only after the nftables transaction succeeds.
+	// If nft.Run() fails, the cache must reflect what is actually
+	// programmed so the next retry recomputes the correct diff.
+	if cachedState.v4LB != "" {
+		cachedState.v4Eps.Insert(v4ToAdd.UnsortedList()...)
+		cachedState.v4Eps.Delete(v4ToDelete.UnsortedList()...)
+	}
+	if cachedState.v6LB != "" {
+		cachedState.v6Eps.Insert(v6ToAdd.UnsortedList()...)
+		cachedState.v6Eps.Delete(v6ToDelete.UnsortedList()...)
 	}
 
 	// At this point we finished handling the SNAT rules
@@ -976,23 +984,25 @@ func (c *Controller) clearServiceSNATRules(state *svcState) error {
 			Map: NFTablesMapV4,
 			Key: []string{ip},
 		})
-		state.v4Eps.Delete(ip)
 	}
-	state.v4LB = ""
 
 	for ip := range state.v6Eps {
 		tx.Delete(&knftables.Element{
 			Map: NFTablesMapV6,
 			Key: []string{ip},
 		})
-		state.v6Eps.Delete(ip)
 	}
-	state.v6LB = ""
 
 	err = nft.Run(context.TODO(), tx)
 	if err != nil {
 		return err
 	}
+
+	// Clear the cache only after the nftables transaction succeeds.
+	state.v4Eps = sets.New[string]()
+	state.v4LB = ""
+	state.v6Eps = sets.New[string]()
+	state.v6LB = ""
 	return nil
 }
 
