@@ -18,8 +18,9 @@ import (
 )
 
 const (
-	protoPrefixV4 = "ip"
-	protoPrefixV6 = "ipv6"
+	protoPrefixV4                   = "ip"
+	protoPrefixV6                   = "ipv6"
+	externalIngressSteeringPriority = 52
 )
 
 func matchIPNetFamily(isIPv6 bool, ipnets []*net.IPNet) []*net.IPNet {
@@ -1456,18 +1457,19 @@ func (b *BridgeConfiguration) arpFanoutFilterFlows(matchVLAN string) []string {
 // source patch. NORMAL still delivers the packet to provider/localnet ports
 // and learns the source MAC; GR/control ports are excluded by their no-flood
 // configuration. The caller only uses this for a complete, non-shared role
-// snapshot.
+// snapshot. Priority 52 deliberately precedes the priority-50 IPv6
+// destination-MAC conntrack path so NDP is not intercepted before steering.
 func externalIngressSteeringFlows(roles ExternalIngressPortRoles, matchVLAN string) []string {
 	var flows []string
 	for _, ingressPort := range roles.externalIngressPorts() {
 		if config.IPv4Mode {
-			flows = append(flows, fmt.Sprintf("cookie=%s, priority=12, table=0, in_port=%s, %s arp, actions=output:%s,NORMAL",
-				nodetypes.DefaultOpenFlowCookie, ingressPort, matchVLAN, roles.DesignatedSourcePatch))
+			flows = append(flows, fmt.Sprintf("cookie=%s, priority=%d, table=0, in_port=%s, %s arp, actions=output:%s,NORMAL",
+				nodetypes.DefaultOpenFlowCookie, externalIngressSteeringPriority, ingressPort, matchVLAN, roles.DesignatedSourcePatch))
 		}
 		if config.IPv6Mode {
 			for _, icmpType := range []int{134, types.NeighborSolicitationICMPType, types.NeighborAdvertisementICMPType} {
-				flows = append(flows, fmt.Sprintf("cookie=%s, priority=12, table=0, in_port=%s, %s icmp6, icmpv6_type=%d, actions=output:%s,NORMAL",
-					nodetypes.DefaultOpenFlowCookie, ingressPort, matchVLAN, icmpType, roles.DesignatedSourcePatch))
+				flows = append(flows, fmt.Sprintf("cookie=%s, priority=%d, table=0, in_port=%s, %s icmp6, icmpv6_type=%d, actions=output:%s,NORMAL",
+					nodetypes.DefaultOpenFlowCookie, externalIngressSteeringPriority, ingressPort, matchVLAN, icmpType, roles.DesignatedSourcePatch))
 			}
 		}
 	}

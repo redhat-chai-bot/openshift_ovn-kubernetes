@@ -347,17 +347,24 @@ func TestExternalIngressSteeringFlowsUseClassifiedPortsAndDesignatedSource(t *te
 		PhysicalUplink:        "7",
 		ProviderLocalnetPorts: []string{"8"},
 		GRControlPorts:        []string{"9", "10"},
+		SharedProviderPorts:   []string{"11"},
 		DesignatedSourcePatch: "10", // selected Uplink source, not the default GR patch
 	}
 	flows := externalIngressSteeringFlows(roles, "dl_vlan=100,")
+	if externalIngressSteeringPriority <= 50 {
+		t.Fatalf("ICMPv6 steering priority %d must precede the priority-50 IPv6 conntrack path", externalIngressSteeringPriority)
+	}
 
 	for _, ingress := range []string{"7", "8"} {
-		expectFlow(t, flows, fmt.Sprintf("cookie=%s, priority=12, table=0, in_port=%s, dl_vlan=100, arp, actions=output:10,NORMAL",
-			nodetypes.DefaultOpenFlowCookie, ingress))
+		expectFlow(t, flows, fmt.Sprintf("cookie=%s, priority=%d, table=0, in_port=%s, dl_vlan=100, arp, actions=output:10,NORMAL",
+			nodetypes.DefaultOpenFlowCookie, externalIngressSteeringPriority, ingress))
 		for _, icmpType := range []int{134, types.NeighborSolicitationICMPType, types.NeighborAdvertisementICMPType} {
-			expectFlow(t, flows, fmt.Sprintf("cookie=%s, priority=12, table=0, in_port=%s, dl_vlan=100, icmp6, icmpv6_type=%d, actions=output:10,NORMAL",
-				nodetypes.DefaultOpenFlowCookie, ingress, icmpType))
+			expectFlow(t, flows, fmt.Sprintf("cookie=%s, priority=%d, table=0, in_port=%s, dl_vlan=100, icmp6, icmpv6_type=%d, actions=output:10,NORMAL",
+				nodetypes.DefaultOpenFlowCookie, externalIngressSteeringPriority, ingress, icmpType))
 		}
+	}
+	for _, excludedPort := range []string{"9", "10", "11"} {
+		expectNoFlow(t, flows, fmt.Sprintf("in_port=%s,", excludedPort))
 	}
 
 	bridge := &BridgeConfiguration{
