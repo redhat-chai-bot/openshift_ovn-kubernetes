@@ -11,6 +11,8 @@ import (
 	"sort"
 	"testing"
 
+	"github.com/google/uuid"
+
 	libovsdbclient "github.com/ovn-kubernetes/libovsdb/client"
 
 	libovsdbtest "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/testing/libovsdb"
@@ -840,6 +842,60 @@ func TestListBridgePorts(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestListBridgePortsReturnsErrorForStaleReferences(t *testing.T) {
+	bridgeUUID := buildNamedUUID()
+	portUUID := buildNamedUUID()
+	ifaceUUID := buildNamedUUID()
+	bridge := &vswitchd.Bridge{UUID: bridgeUUID, Name: "br-int", Ports: []string{portUUID}}
+	port := &vswitchd.Port{UUID: portUUID, Name: "bond0", Interfaces: []string{ifaceUUID}}
+	iface := &vswitchd.Interface{UUID: ifaceUUID, Name: "eth0", Type: "system"}
+
+	newClient := func(t *testing.T) libovsdbclient.Client {
+		t.Helper()
+		ovsClient, cleanup, err := libovsdbtest.NewOVSTestHarness(libovsdbtest.TestSetup{OVSData: []libovsdbtest.TestData{
+			&vswitchd.OpenvSwitch{UUID: "root-ovs", Bridges: []string{bridgeUUID}}, bridge.DeepCopy(), port.DeepCopy(), iface.DeepCopy(),
+		}})
+		if err != nil {
+			t.Fatalf("failed to create OVSDB test harness: %v", err)
+		}
+		t.Cleanup(cleanup.Cleanup)
+		return ovsClient
+	}
+
+	// Strong references prevent these rows in a healthy OVSDB, but cache
+	// updates can briefly expose stale UUIDs while rows are being replaced. A
+	// failed traversal must leave callers' last known-good flow inputs intact.
+	t.Run("missing bridge port", func(t *testing.T) {
+		ovsClient := newClient(t)
+		cachedBridge, err := GetBridge(ovsClient, "br-int")
+		if err != nil {
+			t.Fatalf("failed to get cached bridge: %v", err)
+		}
+		cachedBridge.Ports = append([]string{uuid.NewString()}, cachedBridge.Ports...)
+		if _, err := ovsClient.Cache().Table(vswitchd.BridgeTable).Update(cachedBridge.UUID, cachedBridge, false); err != nil {
+			t.Fatalf("failed to inject stale bridge port reference: %v", err)
+		}
+		if _, err := ListBridgePorts(ovsClient, "br-int"); !errors.Is(err, libovsdbclient.ErrNotFound) {
+			t.Fatalf("ListBridgePorts() error = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("missing port interface", func(t *testing.T) {
+		ovsClient := newClient(t)
+		cachedPort, err := GetOVSPort(ovsClient, "bond0")
+		if err != nil {
+			t.Fatalf("failed to get cached port: %v", err)
+		}
+		cachedPort.Interfaces = append(cachedPort.Interfaces, uuid.NewString())
+		if _, err := ovsClient.Cache().Table(vswitchd.PortTable).Update(cachedPort.UUID, cachedPort, false); err != nil {
+			t.Fatalf("failed to inject stale port interface reference: %v", err)
+		}
+		if _, err := ListBridgePorts(ovsClient, "br-int"); !errors.Is(err, libovsdbclient.ErrNotFound) {
+			t.Fatalf("ListBridgePorts() error = %v, want ErrNotFound", err)
+		}
+	})
 }
 
 func TestCreateOrUpdatePortWithInterface(t *testing.T) {

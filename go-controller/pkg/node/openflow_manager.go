@@ -174,6 +174,11 @@ func (c *openflowManager) uplinkSourceNetwork(bridgeName string) string {
 // managed bridges. It does not render flows; callers rebuild DEFAULT entries
 // with the retained host inputs when this reports a change.
 func (c *openflowManager) refreshExternalIngressPortRoles() (bool, error) {
+	// External ingress roles only affect the network-segmentation ARP/ND and
+	// GR-control flows. Do not add an OVSDB dependency to legacy operation.
+	if !util.IsNetworkSegmentationSupportEnabled() {
+		return false, nil
+	}
 	changed, err := c.defaultBridge.RefreshExternalIngressPortRoles(types.DefaultNetworkName)
 	if err != nil {
 		return false, err

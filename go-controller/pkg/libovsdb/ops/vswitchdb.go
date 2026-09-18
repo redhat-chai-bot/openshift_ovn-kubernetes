@@ -379,6 +379,10 @@ func ListBridgePorts(ovsClient libovsdbclient.Client, bridgeName string) ([]OVSB
 	if err != nil {
 		return nil, fmt.Errorf("failed to list ports on bridge %s: %w", bridgeName, err)
 	}
+	portsByUUID := make(map[string]*vswitchd.Port, len(ports))
+	for _, port := range ports {
+		portsByUUID[port.UUID] = port
+	}
 	interfaces, err := ListInterfaces(ovsClient)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list interfaces on bridge %s: %w", bridgeName, err)
@@ -388,13 +392,19 @@ func ListBridgePorts(ovsClient libovsdbclient.Client, bridgeName string) ([]OVSB
 		interfacesByUUID[iface.UUID] = iface
 	}
 
-	result := make([]OVSBridgePort, 0, len(ports))
-	for _, port := range ports {
+	result := make([]OVSBridgePort, 0, len(bridge.Ports))
+	for _, portUUID := range bridge.Ports {
+		port, ok := portsByUUID[portUUID]
+		if !ok {
+			return nil, fmt.Errorf("bridge %s references missing port %s: %w", bridgeName, portUUID, libovsdbclient.ErrNotFound)
+		}
 		bridgePort := OVSBridgePort{Port: port}
 		for _, ifaceUUID := range port.Interfaces {
-			if iface, ok := interfacesByUUID[ifaceUUID]; ok {
-				bridgePort.Interfaces = append(bridgePort.Interfaces, iface)
+			iface, ok := interfacesByUUID[ifaceUUID]
+			if !ok {
+				return nil, fmt.Errorf("port %s on bridge %s references missing interface %s: %w", port.Name, bridgeName, ifaceUUID, libovsdbclient.ErrNotFound)
 			}
+			bridgePort.Interfaces = append(bridgePort.Interfaces, iface)
 		}
 		result = append(result, bridgePort)
 	}
