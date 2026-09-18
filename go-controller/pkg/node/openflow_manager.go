@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +23,7 @@ import (
 	ovsops "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/libovsdb/ops"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/node/bridgeconfig"
 	nodetypes "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/node/types"
+	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/types"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/util"
 )
 
@@ -70,6 +72,12 @@ type openflowManager struct {
 	// channel to indicate we need to update flows immediately
 	flowChan  chan struct{}
 	ovsClient libovsdbclient.Client
+	// static flow inputs are retained so periodic OVSDB role refresh can rebuild
+	// DEFAULT entries without guessing the current node addresses or subnets.
+	staticFlowInputsMu sync.Mutex
+	staticHostIPs      []net.IP
+	staticHostSubnets  []*net.IPNet
+	staticInputsSet    bool
 }
 
 type openflowBridge struct {
@@ -154,6 +162,54 @@ func (c *openflowManager) getUplinkBridgePortConfigurations() map[string]bridgeP
 		return nil
 	})
 	return configs
+}
+
+func (c *openflowManager) uplinkSourceNetwork(bridgeName string) string {
+	c.uplinkBridgesMu.Lock()
+	defer c.uplinkBridgesMu.Unlock()
+	return c.uplinkBridgeNetworks[bridgeName].defaultNetwork
+}
+
+// refreshExternalIngressPortRoles refreshes dynamic OVSDB port roles for all
+// managed bridges. It does not render flows; callers rebuild DEFAULT entries
+// with the retained host inputs when this reports a change.
+func (c *openflowManager) refreshExternalIngressPortRoles() (bool, error) {
+	changed, err := c.defaultBridge.RefreshExternalIngressPortRoles(types.DefaultNetworkName)
+	if err != nil {
+		return false, err
+	}
+	if c.externalGatewayBridge != nil {
+		externalChanged, err := c.externalGatewayBridge.RefreshExternalIngressPortRoles(types.DefaultNetworkName)
+		if err != nil {
+			return false, err
+		}
+		changed = changed || externalChanged
+	}
+	if err := c.forEachUplinkBridge(func(bridgeName string, bridge *openflowBridge) error {
+		bridgeChanged, err := bridge.RefreshExternalIngressPortRoles(c.uplinkSourceNetwork(bridgeName))
+		if err != nil {
+			return err
+		}
+		changed = changed || bridgeChanged
+		return nil
+	}); err != nil {
+		return false, err
+	}
+	return changed, nil
+}
+
+func (c *openflowManager) setStaticFlowInputs(hostIPs []net.IP, hostSubnets []*net.IPNet) {
+	c.staticFlowInputsMu.Lock()
+	defer c.staticFlowInputsMu.Unlock()
+	c.staticHostIPs = slices.Clone(hostIPs)
+	c.staticHostSubnets = slices.Clone(hostSubnets)
+	c.staticInputsSet = true
+}
+
+func (c *openflowManager) getStaticFlowInputs() ([]net.IP, []*net.IPNet, bool) {
+	c.staticFlowInputsMu.Lock()
+	defer c.staticFlowInputsMu.Unlock()
+	return slices.Clone(c.staticHostIPs), slices.Clone(c.staticHostSubnets), c.staticInputsSet
 }
 
 func (c *openflowManager) addNetwork(bridgeName string, bridge *bridgeconfig.BridgeConfiguration, nInfo util.NetInfo,
@@ -725,6 +781,22 @@ func (c *openflowManager) Run(stopChan <-chan struct{}, doneWg *sync.WaitGroup) 
 		for {
 			select {
 			case <-timer.C:
+				rolesChanged, err := c.refreshExternalIngressPortRoles()
+				if err != nil {
+					klog.Errorf("Failed to refresh external ingress port roles: %v", err)
+					continue
+				}
+				if rolesChanged {
+					hostIPs, hostSubnets, found := c.getStaticFlowInputs()
+					if !found {
+						klog.Warning("External ingress port roles changed before static flow inputs were available")
+						continue
+					}
+					if err := c.rebuildBridgeFlowCache(hostIPs, hostSubnets); err != nil {
+						klog.Errorf("Failed to rebuild static bridge flows after external ingress port role change: %v", err)
+						continue
+					}
+				}
 
 				netConfigs, physIntf, ofPortPhys := c.getDefaultBridgePortConfigurations()
 				if err := checkPorts(c.ovsClient, netConfigs, physIntf, ofPortPhys); err != nil {
@@ -777,6 +849,18 @@ func (c *openflowManager) updateBridgePMTUDFlowCache(key string, ipAddrs []strin
 // updateBridgeFlowCache generates the "static" per-bridge flows
 // note: this is shared between shared and local gateway modes
 func (c *openflowManager) updateBridgeFlowCache(hostIPs []net.IP, hostSubnets []*net.IPNet) error {
+	c.setStaticFlowInputs(hostIPs, hostSubnets)
+	if _, err := c.refreshExternalIngressPortRoles(); err != nil {
+		return fmt.Errorf("failed to refresh external ingress port roles: %w", err)
+	}
+	return c.rebuildBridgeFlowCache(hostIPs, hostSubnets)
+}
+
+// rebuildBridgeFlowCache renders static flows from already-refreshed bridge
+// state. Callers must provide the current host inputs; this separation keeps
+// port discovery out of flow rendering and lets the periodic reconciler safely
+// rebuild DEFAULT cache entries after an OVSDB role/ofport change.
+func (c *openflowManager) rebuildBridgeFlowCache(hostIPs []net.IP, hostSubnets []*net.IPNet) error {
 	// CAUTION: when adding new flows where the in_port is ofPortPatch and the out_port is ofPortPhys, ensure
 	// that dl_src is included in match criteria!
 

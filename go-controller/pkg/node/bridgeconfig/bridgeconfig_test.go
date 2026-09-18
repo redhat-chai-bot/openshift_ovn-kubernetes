@@ -17,6 +17,7 @@ import (
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/config"
 	uplinkv1alpha1 "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/crd/uplink/v1alpha1"
 	ovsops "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/libovsdb/ops"
+	nodetypes "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/node/types"
 	ovntest "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/testing"
 	libovsdbtest "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/testing/libovsdb"
 	ovntypes "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/types"
@@ -54,6 +55,105 @@ func TestGetStaticFDBPort(t *testing.T) {
 				t.Fatalf("expected static FDB port %q, got %q", tc.expected, got)
 			}
 		})
+	}
+}
+
+func TestRefreshExternalIngressPortRoles(t *testing.T) {
+	newClient := func(t *testing.T, physicalOfport, defaultOfport, sourceOfport int, includeProvider bool) libovsdbclient.Client {
+		t.Helper()
+		bridgeUUID := "bridge-uuid"
+		physPortUUID := "phys-port-uuid"
+		defaultPortUUID := "default-port-uuid"
+		sourcePortUUID := "source-port-uuid"
+		ports := []string{physPortUUID, defaultPortUUID, sourcePortUUID}
+		data := []libovsdbtest.TestData{
+			&vswitchd.OpenvSwitch{UUID: "root-ovs", Bridges: []string{bridgeUUID}},
+			&vswitchd.Port{UUID: physPortUUID, Name: "uplink-port", Interfaces: []string{"phys-iface"}},
+			&vswitchd.Interface{UUID: "phys-iface", Name: "eth0", Type: "system", Ofport: ptr.To(physicalOfport)},
+			&vswitchd.Port{UUID: defaultPortUUID, Name: "default-gr-port", Interfaces: []string{"default-gr-iface"}},
+			&vswitchd.Interface{UUID: "default-gr-iface", Name: "patch-default-to-br-int", Type: "patch", Ofport: ptr.To(defaultOfport)},
+			&vswitchd.Port{UUID: sourcePortUUID, Name: "blue-gr-port", Interfaces: []string{"blue-gr-iface"}},
+			&vswitchd.Interface{UUID: "blue-gr-iface", Name: "patch-blue-to-br-int", Type: "patch", Ofport: ptr.To(sourceOfport)},
+		}
+		if includeProvider {
+			ports = append(ports, "provider-port-uuid")
+			data = append(data,
+				&vswitchd.Port{UUID: "provider-port-uuid", Name: "provider-port", ExternalIDs: map[string]string{"ovn-localnet-port": ""}, Interfaces: []string{"provider-iface"}},
+				&vswitchd.Interface{UUID: "provider-iface", Name: "patch-blue_ovn_localnet_port-to-br-int", Type: "patch", Ofport: ptr.To(8)},
+			)
+		}
+		data = append(data, &vswitchd.Bridge{UUID: bridgeUUID, Name: "br-ex", Ports: ports})
+		client, cleanup, err := libovsdbtest.NewOVSTestHarness(libovsdbtest.TestSetup{OVSData: data})
+		if err != nil {
+			t.Fatalf("failed to create OVSDB test harness: %v", err)
+		}
+		t.Cleanup(cleanup.Cleanup)
+		return client
+	}
+
+	bridge := &BridgeConfiguration{
+		ovsClient:  newClient(t, 7, 9, 10, true),
+		bridgeName: "br-ex",
+		uplinkName: "eth0",
+		netConfig: map[string]*BridgeUDNConfiguration{
+			ovntypes.DefaultNetworkName: {PatchPort: "patch-default-to-br-int", MasqCTMark: nodetypes.CtMarkOVN},
+			"blue":                      {PatchPort: "patch-blue-to-br-int", MasqCTMark: "0x4"},
+		},
+	}
+
+	changed, err := bridge.RefreshExternalIngressPortRoles("blue")
+	if err != nil || !changed {
+		t.Fatalf("initial role refresh = (%t, %v), want (true, nil)", changed, err)
+	}
+	if got, want := bridge.ExternalIngressPortRoles(), (ExternalIngressPortRoles{
+		PhysicalUplink:        "7",
+		ProviderLocalnetPorts: []string{"8"},
+		GRControlPorts:        []string{"10", "9"},
+		DesignatedSourcePatch: "10",
+	}); !got.equal(want) {
+		t.Fatalf("initial roles = %#v, want %#v", got, want)
+	}
+	changed, err = bridge.RefreshExternalIngressPortRoles("blue")
+	if err != nil || changed {
+		t.Fatalf("unchanged role refresh = (%t, %v), want (false, nil)", changed, err)
+	}
+
+	// A fresh OVSDB cache models port recreation/removal: all remaining
+	// ofports changed and the provider localnet port disappeared.
+	bridge.ovsClient = newClient(t, 17, 19, 20, false)
+	changed, err = bridge.RefreshExternalIngressPortRoles("blue")
+	if err != nil || !changed {
+		t.Fatalf("changed role refresh = (%t, %v), want (true, nil)", changed, err)
+	}
+	if got, want := bridge.ExternalIngressPortRoles(), (ExternalIngressPortRoles{
+		PhysicalUplink:        "17",
+		GRControlPorts:        []string{"19", "20"},
+		DesignatedSourcePatch: "20",
+	}); !got.equal(want) {
+		t.Fatalf("refreshed roles = %#v, want %#v", got, want)
+	}
+	if got := bridge.netConfig[ovntypes.DefaultNetworkName].OfPortPatch; got != "19" {
+		t.Fatalf("default GR ofport = %q, want 19", got)
+	}
+	if got := bridge.netConfig["blue"].OfPortPatch; got != "20" {
+		t.Fatalf("blue GR ofport = %q, want 20", got)
+	}
+}
+
+func TestClassifyExternalIngressPortRolesKeepsSharedPortsOutOfProviderRole(t *testing.T) {
+	bridge := &BridgeConfiguration{
+		netConfig: map[string]*BridgeUDNConfiguration{
+			ovntypes.DefaultNetworkName: {PatchPort: "patch-default-to-br-int", MasqCTMark: nodetypes.CtMarkOVN},
+		},
+	}
+	roles := bridge.classifyExternalIngressPortRoles([]ovsops.OVSBridgePort{{
+		Port: &vswitchd.Port{ExternalIDs: map[string]string{"ovn-localnet-port": ""}},
+		Interfaces: []*vswitchd.Interface{{
+			Name: "patch-default-to-br-int", Type: "patch", Ofport: ptr.To(9),
+		}},
+	}}, ovntypes.DefaultNetworkName)
+	if len(roles.ProviderLocalnetPorts) != 0 || len(roles.SharedProviderPorts) != 1 || roles.SharedProviderPorts[0] != "9" {
+		t.Fatalf("shared provider/GR port must remain unsupported, got %#v", roles)
 	}
 }
 

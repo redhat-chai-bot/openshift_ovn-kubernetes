@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"regexp"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -47,6 +49,41 @@ type BridgeUDNConfiguration struct {
 	// OutboundSNAT setting for this network ("enabled", "disabled", or "")
 	OutboundSNAT string
 }
+
+// ExternalIngressPortRoles is the OpenFlow-relevant view of the ports on one
+// bridge. It is populated from OVSDB by the OpenFlow manager; flow rendering
+// only consumes this snapshot and never performs OVS discovery.
+//
+// A secondary localnet patch can carry both localnet workload traffic and GR
+// traffic in an unsupported shared-port topology. OpenFlow cannot distinguish
+// those packets by in_port, so SharedProviderPorts are deliberately excluded
+// from ProviderLocalnetPorts and retain the pre-existing fallback behavior.
+type ExternalIngressPortRoles struct {
+	PhysicalUplink        string
+	ProviderLocalnetPorts []string
+	GRControlPorts        []string
+	SharedProviderPorts   []string
+	DesignatedSourcePatch string
+}
+
+func (roles ExternalIngressPortRoles) externalIngressPorts() []string {
+	ports := make([]string, 0, 1+len(roles.ProviderLocalnetPorts))
+	if roles.PhysicalUplink != "" {
+		ports = append(ports, roles.PhysicalUplink)
+	}
+	ports = append(ports, roles.ProviderLocalnetPorts...)
+	return ports
+}
+
+func (roles ExternalIngressPortRoles) equal(other ExternalIngressPortRoles) bool {
+	return roles.PhysicalUplink == other.PhysicalUplink &&
+		roles.DesignatedSourcePatch == other.DesignatedSourcePatch &&
+		slices.Equal(roles.ProviderLocalnetPorts, other.ProviderLocalnetPorts) &&
+		slices.Equal(roles.GRControlPorts, other.GRControlPorts) &&
+		slices.Equal(roles.SharedProviderPorts, other.SharedProviderPorts)
+}
+
+var secondaryLocalnetPatchPortRegexp = regexp.MustCompile(`^patch-.+_ovn_localnet_port-to-br-int$`)
 
 func (netConfig *BridgeUDNConfiguration) ShallowCopy() *BridgeUDNConfiguration {
 	copy := &BridgeUDNConfiguration{
@@ -103,6 +140,10 @@ type BridgeConfiguration struct {
 	netConfig  map[string]*BridgeUDNConfiguration
 	eipMarkIPs *egressip.MarkIPsCache
 	dropGARP   bool
+	// externalIngressPortRoles is refreshed from OVSDB by openflowManager. It
+	// is intentionally separate from netConfig: netConfig describes GR network
+	// configuration, while OVS may also have localnet workload ports.
+	externalIngressPortRoles ExternalIngressPortRoles
 }
 
 func NewBridgeConfiguration(ovsClient libovsdbclient.Client, intfName, nodeName,
@@ -502,6 +543,125 @@ func (b *BridgeConfiguration) patchedNetConfigs() []*BridgeUDNConfiguration {
 	return result
 }
 
+// RefreshExternalIngressPortRoles refreshes the bridge's OVSDB-derived port
+// roles. sourceNetwork is selected by the caller: the default network for a
+// shared bridge or the existing Uplink-selected source network for an uplink
+// bridge. It returns true only when the rendered-flow input changed.
+func (b *BridgeConfiguration) RefreshExternalIngressPortRoles(sourceNetwork string) (bool, error) {
+	if b.ovsClient == nil {
+		return false, nil
+	}
+	ports, err := ovsops.ListBridgePorts(b.ovsClient, b.bridgeName)
+	if err != nil {
+		return false, fmt.Errorf("failed to list OVSDB ports for bridge %s: %w", b.bridgeName, err)
+	}
+
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+	roles := b.classifyExternalIngressPortRoles(ports, sourceNetwork)
+	if roles.equal(b.externalIngressPortRoles) {
+		return false, nil
+	}
+	b.externalIngressPortRoles = roles
+	return true, nil
+}
+
+// ExternalIngressPortRoles returns a copy of the current OVSDB-derived port
+// role snapshot for callers that need to reason about bridge-local ingress.
+func (b *BridgeConfiguration) ExternalIngressPortRoles() ExternalIngressPortRoles {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+	roles := b.externalIngressPortRoles
+	roles.ProviderLocalnetPorts = slices.Clone(roles.ProviderLocalnetPorts)
+	roles.GRControlPorts = slices.Clone(roles.GRControlPorts)
+	roles.SharedProviderPorts = slices.Clone(roles.SharedProviderPorts)
+	return roles
+}
+
+// classifyExternalIngressPortRoles follows the OVSDB Bridge -> Port ->
+// Interface relationships supplied by ListBridgePorts. GR/control membership
+// comes from the explicit network patch configuration. Provider/localnet
+// membership prefers the ovn-localnet-port marker and uses the documented
+// secondary-localnet patch name only as a guarded fallback.
+//
+// b.mutex must be held by the caller.
+func (b *BridgeConfiguration) classifyExternalIngressPortRoles(ports []ovsops.OVSBridgePort, sourceNetwork string) ExternalIngressPortRoles {
+	patchNetworks := make(map[string]*BridgeUDNConfiguration, len(b.netConfig))
+	for _, netConfig := range b.netConfig {
+		if netConfig.PatchPort != "" {
+			patchNetworks[netConfig.PatchPort] = netConfig
+		}
+	}
+
+	roles := ExternalIngressPortRoles{}
+	grPorts := map[string]struct{}{}
+	providerPorts := map[string]struct{}{}
+	sharedPorts := map[string]struct{}{}
+	patchOfports := map[*BridgeUDNConfiguration]string{}
+
+	for _, bridgePort := range ports {
+		portHasGRControl := false
+		for _, iface := range bridgePort.Interfaces {
+			if _, ok := patchNetworks[iface.Name]; ok {
+				portHasGRControl = true
+				break
+			}
+		}
+		for _, iface := range bridgePort.Interfaces {
+			if iface.Ofport == nil || *iface.Ofport < 0 {
+				continue
+			}
+			ofport := fmt.Sprintf("%d", *iface.Ofport)
+			if netConfig, ok := patchNetworks[iface.Name]; ok {
+				patchOfports[netConfig] = ofport
+				grPorts[ofport] = struct{}{}
+			}
+			if iface.Name == b.uplinkName {
+				roles.PhysicalUplink = ofport
+			}
+			_, isMarkedLocalnet := bridgePort.Port.ExternalIDs["ovn-localnet-port"]
+			isNamedSecondaryLocalnet := iface.Type == "patch" && secondaryLocalnetPatchPortRegexp.MatchString(iface.Name)
+			if isMarkedLocalnet || isNamedSecondaryLocalnet {
+				if portHasGRControl {
+					sharedPorts[ofport] = struct{}{}
+				} else {
+					providerPorts[ofport] = struct{}{}
+				}
+			}
+		}
+	}
+
+	// Synchronize configured GR patch ofports from the same OVSDB snapshot.
+	// A removed port is cleared so subsequent complete flow replacement cannot
+	// retain output actions to its stale ofport.
+	for _, netConfig := range b.netConfig {
+		if netConfig.PatchPort == "" {
+			continue
+		}
+		netConfig.OfPortPatch = patchOfports[netConfig]
+	}
+	if b.uplinkName != "" {
+		b.ofPortPhys = roles.PhysicalUplink
+	}
+	if sourceConfig, ok := b.netConfig[sourceNetwork]; ok {
+		roles.DesignatedSourcePatch = sourceConfig.OfPortPatch
+	}
+
+	roles.ProviderLocalnetPorts = sortedOfports(providerPorts)
+	roles.GRControlPorts = sortedOfports(grPorts)
+	roles.SharedProviderPorts = sortedOfports(sharedPorts)
+	return roles
+}
+
+func sortedOfports(ports map[string]struct{}) []string {
+	result := make([]string, 0, len(ports))
+	for port := range ports {
+		result = append(result, port)
+	}
+	sort.Strings(result)
+	return result
+}
+
 // IsGatewayReady checks if patch ports of every netConfig are present.
 // used by gateway on newGateway readyFunc
 func (b *BridgeConfiguration) IsGatewayReady() bool {
@@ -634,8 +794,9 @@ func (b *BridgeConfiguration) SetNetworkOfPatchPort(netName string) error {
 	return nil
 }
 
-// SyncNoFlood ensures OFPPC_NO_FLOOD is set on every non-default patch port
-// that shares the bridge with the default network. The flag is OpenFlow
+// SyncNoFlood ensures OFPPC_NO_FLOOD is set on every non-default GR/control
+// port that shares the bridge with the default network. Provider/localnet
+// ports are intentionally excluded by ExternalIngressPortRoles. The flag is OpenFlow
 // port config (not OVSDB-persisted), so it must be reapplied after
 // ovs-vswitchd restarts or ports are re-created.
 //
@@ -658,16 +819,26 @@ func (b *BridgeConfiguration) SyncNoFlood() error {
 		return fmt.Errorf("failed to check no-flood state on bridge %s: %w", b.bridgeName, err)
 	}
 
-	for netName, netConfig := range b.netConfig {
-		if netName == types.DefaultNetworkName || netConfig.PatchPort == "" || netConfig.OfPortPatch == "" {
+	defaultNetConfig := b.netConfig[types.DefaultNetworkName]
+	grControlPorts := b.externalIngressPortRoles.GRControlPorts
+	if len(grControlPorts) == 0 {
+		// Preserve startup behavior until the first OVSDB role refresh.
+		for _, netConfig := range b.patchedNetConfigs() {
+			if defaultNetConfig == nil || netConfig.OfPortPatch != defaultNetConfig.OfPortPatch {
+				grControlPorts = append(grControlPorts, netConfig.OfPortPatch)
+			}
+		}
+	}
+	for _, ofport := range grControlPorts {
+		if defaultNetConfig != nil && ofport == defaultNetConfig.OfPortPatch {
 			continue
 		}
-		if alreadyNoFlood[netConfig.OfPortPatch] {
+		if alreadyNoFlood[ofport] {
 			continue
 		}
-		if err := util.SetPortNoFlood(b.bridgeName, netConfig.OfPortPatch); err != nil {
+		if err := util.SetPortNoFlood(b.bridgeName, ofport); err != nil {
 			return fmt.Errorf("failed to set no-flood on port %s of bridge %s: %w",
-				netConfig.PatchPort, b.bridgeName, err)
+				ofport, b.bridgeName, err)
 		}
 	}
 	return nil

@@ -27,6 +27,17 @@ type ovsPortPredicate func(*vswitchd.Port) bool
 // OVS interface predicates for filtering.
 type ovsInterfacePredicate func(*vswitchd.Interface) bool
 
+// OVSBridgePort is the cached OVSDB representation of a Port and the
+// Interfaces it owns on a particular bridge.
+//
+// OVSDB stores Bridge -> Port -> Interface as UUID references. Keeping the
+// relationship in this helper avoids callers incorrectly assuming a Port and
+// its Interface have the same name or UUID (notably for bonds).
+type OVSBridgePort struct {
+	Port       *vswitchd.Port
+	Interfaces []*vswitchd.Interface
+}
+
 // GetOpenvSwitch returns the singleton Open_vSwitch row from the cache.
 // When no row exists, the returned error wraps libovsdbclient.ErrNotFound so
 // callers can detect that case via errors.Is. This is the libovsdb equivalent
@@ -346,6 +357,48 @@ func GetBridge(ovsClient libovsdbclient.Client, name string) (*vswitchd.Bridge, 
 	}
 
 	return found[0], nil
+}
+
+// ListBridgePorts returns the Ports owned by bridgeName together with their
+// Interfaces. It resolves the Bridge.Ports and Port.Interfaces UUID references
+// from the libovsdb cache; it does not infer membership from interface names.
+func ListBridgePorts(ovsClient libovsdbclient.Client, bridgeName string) ([]OVSBridgePort, error) {
+	bridge, err := GetBridge(ovsClient, bridgeName)
+	if err != nil {
+		return nil, err
+	}
+
+	ports, err := FindOVSPortsWithPredicate(ovsClient, func(port *vswitchd.Port) bool {
+		for _, portUUID := range bridge.Ports {
+			if port.UUID == portUUID {
+				return true
+			}
+		}
+		return false
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list ports on bridge %s: %w", bridgeName, err)
+	}
+	interfaces, err := ListInterfaces(ovsClient)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list interfaces on bridge %s: %w", bridgeName, err)
+	}
+	interfacesByUUID := make(map[string]*vswitchd.Interface, len(interfaces))
+	for _, iface := range interfaces {
+		interfacesByUUID[iface.UUID] = iface
+	}
+
+	result := make([]OVSBridgePort, 0, len(ports))
+	for _, port := range ports {
+		bridgePort := OVSBridgePort{Port: port}
+		for _, ifaceUUID := range port.Interfaces {
+			if iface, ok := interfacesByUUID[ifaceUUID]; ok {
+				bridgePort.Interfaces = append(bridgePort.Interfaces, iface)
+			}
+		}
+		result = append(result, bridgePort)
+	}
+	return result, nil
 }
 
 // DeleteBridge deletes an OVS bridge and detaches it from the Open_vSwitch root

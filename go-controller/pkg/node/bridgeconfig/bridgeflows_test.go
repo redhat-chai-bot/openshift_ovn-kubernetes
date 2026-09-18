@@ -335,6 +335,53 @@ func TestArpFanoutFilterFlowsIncludeVLAN(t *testing.T) {
 		"actions=", "output:patch-breth0_bluenet", "output:patch-breth0_ov", "NORMAL")
 }
 
+func TestExternalIngressSteeringFlowsUseClassifiedPortsAndDesignatedSource(t *testing.T) {
+	if err := config.PrepareTestConfig(); err != nil {
+		t.Fatalf("failed to prepare test config: %v", err)
+	}
+	t.Cleanup(func() { _ = config.PrepareTestConfig() })
+	config.IPv4Mode = true
+	config.IPv6Mode = true
+
+	roles := ExternalIngressPortRoles{
+		PhysicalUplink:        "7",
+		ProviderLocalnetPorts: []string{"8"},
+		GRControlPorts:        []string{"9", "10"},
+		DesignatedSourcePatch: "10", // selected Uplink source, not the default GR patch
+	}
+	flows := externalIngressSteeringFlows(roles, "dl_vlan=100,")
+
+	for _, ingress := range []string{"7", "8"} {
+		expectFlow(t, flows, fmt.Sprintf("cookie=%s, priority=12, table=0, in_port=%s, dl_vlan=100, arp, actions=output:10,NORMAL",
+			nodetypes.DefaultOpenFlowCookie, ingress))
+		for _, icmpType := range []int{134, types.NeighborSolicitationICMPType, types.NeighborAdvertisementICMPType} {
+			expectFlow(t, flows, fmt.Sprintf("cookie=%s, priority=12, table=0, in_port=%s, dl_vlan=100, icmp6, icmpv6_type=%d, actions=output:10,NORMAL",
+				nodetypes.DefaultOpenFlowCookie, ingress, icmpType))
+		}
+	}
+
+	bridge := &BridgeConfiguration{
+		ofPortPhys:               "7",
+		macAddress:               mustParseMAC(t, "62:41:d0:54:3d:64"),
+		externalIngressPortRoles: roles,
+		netConfig: map[string]*BridgeUDNConfiguration{
+			types.DefaultNetworkName: {OfPortPatch: "9", MasqCTMark: nodetypes.CtMarkOVN},
+		},
+	}
+	config.OVNKubernetesFeature.EnableMultiNetwork = true
+	config.OVNKubernetesFeature.EnableNetworkSegmentation = true
+	config.IPv4Mode = false // avoid requiring a physical node IP in commonFlows
+	config.IPv6Mode = false
+	flows, err := bridge.commonFlows(nil)
+	if err != nil {
+		t.Fatalf("failed to render bridge flows: %v", err)
+	}
+	// GR source validation is explicit and never applies to the provider port.
+	expectFlow(t, flows, fmt.Sprintf("cookie=%s, priority=9, table=0, in_port=9, actions=drop", nodetypes.DefaultOpenFlowCookie))
+	expectFlow(t, flows, fmt.Sprintf("cookie=%s, priority=9, table=0, in_port=10, actions=drop", nodetypes.DefaultOpenFlowCookie))
+	expectNoFlow(t, flows, "priority=9, table=0, in_port=8, actions=drop")
+}
+
 func mustParseMAC(t *testing.T, value string) net.HardwareAddr {
 	t.Helper()
 	mac, err := net.ParseMAC(value)

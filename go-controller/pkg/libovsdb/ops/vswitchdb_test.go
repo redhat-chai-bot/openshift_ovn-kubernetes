@@ -781,6 +781,67 @@ func TestFindOVSPortsWithPredicate(t *testing.T) {
 	}
 }
 
+func TestListBridgePorts(t *testing.T) {
+	bridgeAUUID := buildNamedUUID()
+	bridgeBUUID := buildNamedUUID()
+	portAUUID := buildNamedUUID()
+	portBUUID := buildNamedUUID()
+	ifaceAUUID := buildNamedUUID()
+	ifaceBUUID := buildNamedUUID()
+
+	ovs := &vswitchd.OpenvSwitch{UUID: "root-ovs", Bridges: []string{bridgeAUUID, bridgeBUUID}}
+	bridgeA := &vswitchd.Bridge{UUID: bridgeAUUID, Name: "br-a", Ports: []string{portAUUID}}
+	bridgeB := &vswitchd.Bridge{UUID: bridgeBUUID, Name: "br-b", Ports: []string{portBUUID}}
+	portA := &vswitchd.Port{UUID: portAUUID, Name: "bond0", Interfaces: []string{ifaceAUUID}}
+	portB := &vswitchd.Port{UUID: portBUUID, Name: "other", Interfaces: []string{ifaceBUUID}}
+	ifaceA := &vswitchd.Interface{UUID: ifaceAUUID, Name: "eth0", Type: "system"}
+	ifaceB := &vswitchd.Interface{UUID: ifaceBUUID, Name: "eth1", Type: "system"}
+
+	tests := []struct {
+		name          string
+		bridgeName    string
+		expectedPorts map[string][]string
+	}{
+		{
+			name:       "follows bridge port and interface UUIDs",
+			bridgeName: "br-a",
+			expectedPorts: map[string][]string{
+				"bond0": {"eth0"},
+			},
+		},
+		{
+			name:          "does not include ports from another bridge",
+			bridgeName:    "br-b",
+			expectedPorts: map[string][]string{"other": {"eth1"}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ovsClient, cleanup, err := libovsdbtest.NewOVSTestHarness(libovsdbtest.TestSetup{OVSData: []libovsdbtest.TestData{
+				ovs.DeepCopy(), bridgeA.DeepCopy(), bridgeB.DeepCopy(), portA.DeepCopy(), portB.DeepCopy(), ifaceA.DeepCopy(), ifaceB.DeepCopy(),
+			}})
+			if err != nil {
+				t.Fatalf("failed to create OVSDB test harness: %v", err)
+			}
+			t.Cleanup(cleanup.Cleanup)
+
+			bridgePorts, err := ListBridgePorts(ovsClient, tt.bridgeName)
+			if err != nil {
+				t.Fatalf("ListBridgePorts() error: %v", err)
+			}
+			got := map[string][]string{}
+			for _, bridgePort := range bridgePorts {
+				for _, iface := range bridgePort.Interfaces {
+					got[bridgePort.Port.Name] = append(got[bridgePort.Port.Name], iface.Name)
+				}
+			}
+			if !reflect.DeepEqual(got, tt.expectedPorts) {
+				t.Fatalf("ListBridgePorts() = %#v, want %#v", got, tt.expectedPorts)
+			}
+		})
+	}
+}
+
 func TestCreateOrUpdatePortWithInterface(t *testing.T) {
 	bridgeUUID := buildNamedUUID()
 

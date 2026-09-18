@@ -827,20 +827,29 @@ func (b *BridgeConfiguration) commonFlows(hostSubnets []*net.IPNet) ([]string, e
 			fmt.Sprintf("cookie=%s, priority=10, table=0, %s dl_dst=%s, actions=%s",
 				nodetypes.DefaultOpenFlowCookie, matchVLAN, bridgeMacAddress, actions))
 
-		if util.IsNetworkSegmentationSupportEnabled() {
-			dftFlows = append(dftFlows, b.arpFanoutFilterFlows(ofPortPhys, matchVLAN)...)
-		}
+	}
+	if util.IsNetworkSegmentationSupportEnabled() {
+		dftFlows = append(dftFlows, b.arpFanoutFilterFlows(matchVLAN)...)
 	}
 
 	// table 0, check packets coming from OVN have the correct mac address. Low priority flows that are a catch all
 	// for non-IP packets that would normally be forwarded with NORMAL action (table 0, priority 0 flow).
-	for _, netConfig := range b.patchedNetConfigs() {
+	grControlPorts := b.externalIngressPortRoles.GRControlPorts
+	if len(grControlPorts) == 0 {
+		// The role snapshot is populated by the OpenFlow manager after OVSDB
+		// becomes available. Preserve the existing behavior for startup and
+		// unsupported topologies until then.
+		for _, netConfig := range b.patchedNetConfigs() {
+			grControlPorts = append(grControlPorts, netConfig.OfPortPatch)
+		}
+	}
+	for _, ofPortGR := range grControlPorts {
 		dftFlows = append(dftFlows,
 			fmt.Sprintf("cookie=%s, priority=10, table=0, in_port=%s, dl_src=%s, actions=output:NORMAL",
-				nodetypes.DefaultOpenFlowCookie, netConfig.OfPortPatch, bridgeMacAddress))
+				nodetypes.DefaultOpenFlowCookie, ofPortGR, bridgeMacAddress))
 		dftFlows = append(dftFlows,
 			fmt.Sprintf("cookie=%s, priority=9, table=0, in_port=%s, actions=drop",
-				nodetypes.DefaultOpenFlowCookie, netConfig.OfPortPatch))
+				nodetypes.DefaultOpenFlowCookie, ofPortGR))
 	}
 
 	if config.IPv4Mode {
@@ -1337,7 +1346,20 @@ func (b *BridgeConfiguration) allowNodeIPGARPFlows(nodeIPs []net.IP) []string {
 // caught at priority-12 first.
 //
 // Must be called with bridge.mutex held.
-func (b *BridgeConfiguration) arpFanoutFilterFlows(ofPortPhys, matchVLAN string) []string {
+func (b *BridgeConfiguration) arpFanoutFilterFlows(matchVLAN string) []string {
+	roles := b.externalIngressPortRoles
+	if roles.DesignatedSourcePatch != "" && len(roles.SharedProviderPorts) == 0 && len(roles.externalIngressPorts()) > 0 {
+		return externalIngressSteeringFlows(roles, matchVLAN)
+	}
+
+	// An empty snapshot is expected before the manager's first OVSDB refresh.
+	// A shared provider/GR Port is intentionally unsupported: in_port cannot
+	// identify whether a packet came from a localnet workload or a GR. Keep the
+	// proven fanout behavior in both cases instead of narrowing it unsafely.
+	ofPortPhys := b.ofPortPhys
+	if ofPortPhys == "" {
+		return nil
+	}
 	defaultNetConfig, found := b.netConfig[types.DefaultNetworkName]
 	if !found || defaultNetConfig.OfPortPatch == "" {
 		return nil
@@ -1426,6 +1448,29 @@ func (b *BridgeConfiguration) arpFanoutFilterFlows(ofPortPhys, matchVLAN string)
 		}
 	}
 
+	return flows
+}
+
+// externalIngressSteeringFlows directs ARP and IPv6 router/neighbor discovery
+// received from every known external ingress to the bridge-local designated
+// source patch. NORMAL still delivers the packet to provider/localnet ports
+// and learns the source MAC; GR/control ports are excluded by their no-flood
+// configuration. The caller only uses this for a complete, non-shared role
+// snapshot.
+func externalIngressSteeringFlows(roles ExternalIngressPortRoles, matchVLAN string) []string {
+	var flows []string
+	for _, ingressPort := range roles.externalIngressPorts() {
+		if config.IPv4Mode {
+			flows = append(flows, fmt.Sprintf("cookie=%s, priority=12, table=0, in_port=%s, %s arp, actions=output:%s,NORMAL",
+				nodetypes.DefaultOpenFlowCookie, ingressPort, matchVLAN, roles.DesignatedSourcePatch))
+		}
+		if config.IPv6Mode {
+			for _, icmpType := range []int{134, types.NeighborSolicitationICMPType, types.NeighborAdvertisementICMPType} {
+				flows = append(flows, fmt.Sprintf("cookie=%s, priority=12, table=0, in_port=%s, %s icmp6, icmpv6_type=%d, actions=output:%s,NORMAL",
+					nodetypes.DefaultOpenFlowCookie, ingressPort, matchVLAN, icmpType, roles.DesignatedSourcePatch))
+			}
+		}
+	}
 	return flows
 }
 
