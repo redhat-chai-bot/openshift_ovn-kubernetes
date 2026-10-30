@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"testing"
 	"time"
 
 	"github.com/containernetworking/plugins/pkg/ns"
@@ -27,6 +28,7 @@ import (
 	uplinkinformerfactory "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/crd/uplink/v1alpha1/apis/informers/externalversions"
 	factoryMocks "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/factory/mocks"
 	libovsdbops "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/libovsdb/ops"
+	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/node"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/node/routemanager"
 	ovntest "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/testing"
 	libovsdbtest "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/testing/libovsdb"
@@ -44,6 +46,25 @@ import (
 
 func genListStalePortsCmd() string {
 	return "ovs-vsctl --timeout=15 --data=bare --no-headings --columns=name find interface ofport=-1"
+}
+
+func TestMACBindingInitializationGate(t *testing.T) {
+	if err := config.PrepareTestConfig(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = config.PrepareTestConfig() })
+	manager := &NodeControllerManager{}
+	if err := manager.initNodeMacBindingController(); err != nil || manager.macBindingController != nil {
+		t.Fatalf("disabled feature must not initialize a controller: %v", err)
+	}
+	config.Gateway.DisableUDNARPNDPFlood = true
+	manager.defaultNodeNetworkController = &node.DefaultNodeNetworkController{}
+	if err := manager.initNodeMacBindingController(); err == nil {
+		t.Fatal("enabled feature must reject an unavailable OpenFlow provider")
+	}
+	if manager.macBindingController != nil {
+		t.Fatal("failed initialization must not retain a controller")
+	}
 }
 
 func genDeleteStalePortCmd(ifaces ...string) string {
@@ -187,7 +208,7 @@ var _ = Describe("Healthcheck tests", func() {
 			var ovsClient libovsdbclient.Client
 			ovsClient, ovsCleanup = newTestOVSClient(ovsData)
 
-			ncm, err = NewNodeControllerManager(fakeClient, &factoryMock, nodeName, &sync.WaitGroup{}, nil, routeManager, ovsClient)
+			ncm, err = NewNodeControllerManager(fakeClient, &factoryMock, nil, nil, nodeName, &sync.WaitGroup{}, nil, routeManager, ovsClient)
 			Expect(err).NotTo(HaveOccurred())
 		}
 
@@ -323,7 +344,7 @@ var _ = Describe("Healthcheck tests", func() {
 			}
 			expectUplinkInformers(&factoryMock)
 
-			ncm, err := NewNodeControllerManager(fakeClient, &factoryMock, "worker1",
+			ncm, err := NewNodeControllerManager(fakeClient, &factoryMock, nil, nil, "worker1",
 				&sync.WaitGroup{}, nil, routemanager.NewController(), nil)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(ncm.vrfManager).NotTo(BeNil())
@@ -399,7 +420,7 @@ var _ = Describe("Healthcheck tests", func() {
 			factoryMock.On("NodeCoreInformer").Return(nodeInformerMock)
 			expectUplinkInformers(&factoryMock)
 
-			ncm, err := NewNodeControllerManager(fakeClient, &factoryMock, nodeName, &sync.WaitGroup{}, nil, routeManager, nil)
+			ncm, err := NewNodeControllerManager(fakeClient, &factoryMock, nil, nil, nodeName, &sync.WaitGroup{}, nil, routeManager, nil)
 			Expect(err).NotTo(HaveOccurred())
 
 			err = testNS.Do(func(ns.NetNS) error {
@@ -477,7 +498,7 @@ var _ = Describe("Healthcheck tests", func() {
 			factoryMock.On("NodeCoreInformer").Return(nodeInformerMock)
 			expectUplinkInformers(&factoryMock)
 			Expect(err).NotTo(HaveOccurred())
-			ncm, err := NewNodeControllerManager(fakeClient, &factoryMock, nodeName, &sync.WaitGroup{}, nil, routeManager, nil)
+			ncm, err := NewNodeControllerManager(fakeClient, &factoryMock, nil, nil, nodeName, &sync.WaitGroup{}, nil, routeManager, nil)
 			Expect(err).NotTo(HaveOccurred())
 
 			err = testNS.Do(func(ns.NetNS) error {

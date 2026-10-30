@@ -14,6 +14,7 @@ var (
 	AdminNetworkPolicy    = New("AdminNetworkPolicy")
 	BaselineNetworkPolicy = New("BaselineNetworkPolicy")
 	NetworkSegmentation   = New("NetworkSegmentation")
+	Uplink                = New("Uplink")
 	EgressIP              = New("EgressIP")
 	EgressService         = New("EgressService")
 	EgressFirewall        = New("EgressFirewall")
