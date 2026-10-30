@@ -22,6 +22,23 @@ import (
 	ovntypes "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/types"
 )
 
+func TestNetworkScopedGatewayPortNames(t *testing.T) {
+	for networkName, wantPrefix := range map[string]string{
+		ovntypes.DefaultNetworkName: "",
+		"tenant":                    "tenant_",
+		"namespace/tenant-blue":     "namespace.tenant.blue_",
+	} {
+		t.Run(networkName, func(t *testing.T) {
+			if got := GetNetworkScopedNameForNetwork(networkName, "node1"); got != wantPrefix+"node1" {
+				t.Fatalf("unexpected scoped name: %q", got)
+			}
+			if got := GetNetworkScopedGWRouterExtPortName(networkName, "node1"); got != "rtoe-GR_"+wantPrefix+"node1" {
+				t.Fatalf("unexpected gateway port: %q", got)
+			}
+		})
+	}
+}
+
 func TestParseNetworkSubnets(t *testing.T) {
 	tests := []struct {
 		desc            string
